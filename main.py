@@ -1,215 +1,104 @@
-import logging
 import re
-from datetime import datetime, timezone
-from contextlib import asynccontextmanager
-
+from typing import Dict, Any
+from fastapi import FastAPI, HTTPException, Query
+import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from playwright.async_api import async_playwright
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tasas_bot")
-
-latest_rates = {
-    "usd": None,
-    "eur": None,
-    "date": None,
-    "time": None,
-    "updated_at": None,
-    "status": "pending"
-}
-
-
-async def fetch_rates():
-    global latest_rates
-
-    logger.info("Iniciando scraping con Playwright...")
-
-    try:
-
-        async with async_playwright() as p:
-
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/139.0.0.0 Safari/537.36"
-                ),
-                locale="es-ES",
-                viewport={
-                    "width": 1366,
-                    "height": 768,
-                },
-            )
-
-            page = await context.new_page()
-
-            await page.goto(
-                "https://eltoque.com/",
-                wait_until="networkidle",
-                timeout=60000,
-            )
-
-            # Espera unos segundos por si Cloudflare está validando
-            await page.wait_for_timeout(5000)
-
-            logger.info(f"Título: {await page.title()}")
-            logger.info(f"URL final: {page.url}")
-
-            html = await page.content()
-
-            await browser.close()
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        usd_val = None
-        eur_val = None
-
-        # -----------------------------
-        # Estrategia 1
-        # -----------------------------
-        price_spans = soup.find_all(
-            "span",
-            class_=lambda c: c and "font-extrabold" in c and "text-lg" in c,
-        )
-
-        for span in price_spans:
-
-            parent = span.find_parent(
-                lambda tag: tag.name in ["div", "article", "tr", "li"]
-                and (
-                    "USD" in tag.get_text().upper()
-                    or "EUR" in tag.get_text().upper()
-                )
-            )
-
-            raw = span.get_text().replace("\xa0", " ").strip()
-
-            m = re.search(r"[\d\.,]+", raw)
-
-            if not m:
-                continue
-
-            value = m.group(0)
-
-            if parent:
-
-                txt = parent.get_text().upper()
-
-                if "USD" in txt and usd_val is None:
-                    usd_val = value
-
-                elif "EUR" in txt and eur_val is None:
-                    eur_val = value
-
-        # -----------------------------
-        # Estrategia 2 (Backup)
-        # -----------------------------
-        if usd_val is None or eur_val is None:
-
-            full_text = soup.get_text()
-
-            if usd_val is None:
-                m = re.search(
-                    r"USD[^\d]*([\d\.,]+)\s*CUP",
-                    full_text,
-                    re.IGNORECASE,
-                )
-
-                if m:
-                    usd_val = m.group(1)
-
-            if eur_val is None:
-                m = re.search(
-                    r"EUR[^\d]*([\d\.,]+)\s*CUP",
-                    full_text,
-                    re.IGNORECASE,
-                )
-
-                if m:
-                    eur_val = m.group(1)
-
-        now = datetime.now(timezone.utc)
-
-        latest_rates.update(
-            {
-                "usd": usd_val,
-                "eur": eur_val,
-                "date": now.strftime("%Y-%m-%d"),
-                "time": now.strftime("%H:%M:%S"),
-                "updated_at": now.isoformat(),
-                "status": "success",
-            }
-        )
-
-        logger.info(f"✅ USD={usd_val}")
-        logger.info(f"✅ EUR={eur_val}")
-
-    except Exception as e:
-
-        logger.exception("Error durante el scraping")
-
-        latest_rates["status"] = f"error: {e}"
-
-
-scheduler = AsyncIOScheduler()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    await fetch_rates()
-
-    scheduler.add_job(
-        fetch_rates,
-        "interval",
-        hours=1,
-    )
-
-    scheduler.start()
-
-    yield
-
-    scheduler.shutdown()
-
 
 app = FastAPI(
-    title="API Tasas El Toque",
-    lifespan=lifespan,
+    title="API Scraper de Tasas de Cambio - El Toque",
+    description="Endpoint para obtener las tasas del informal en Cuba usando BeautifulSoup4."
 )
 
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
-@app.get("/")
-def root():
+def parse_tasas_html(html_content: str) -> Dict[str, Any]:
+    """
+    Parsea el contenido HTML con BeautifulSoup para extraer la moneda, 
+    su valor en CUP y la variación si existe.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    tasas = {}
+
+    # Buscamos todas las filas <tr> de la tabla
+    rows = soup.find_all("tr")
+
+    for row in rows:
+        # 1. Extraer la moneda/moneda objetivo (ej. "1 USD", "1 EUR", "1 MLC", etc.)
+        currency_cell = row.find("span", id=re.compile(r"^cell-title-v2-"))
+        if not currency_cell:
+            continue
+        
+        currency_raw = currency_cell.get_text(strip=True)
+        # Limpiamos espacios no divisibles (&nbsp;) y extraemos el código (ej. USD)
+        currency = currency_raw.replace("\xa0", " ").strip()
+
+        # 2. Extraer el valor en CUP y posible variación
+        value_cell = row.find("td", class_=re.compile(r"pl-3"))
+        if not value_cell:
+            continue
+
+        # El valor principal está en el span con 'font-extrabold text-lg'
+        rate_span = value_cell.find("span", class_=re.compile(r"font-extrabold"))
+        if not rate_span:
+            continue
+
+        rate_text = rate_span.get_text(strip=True).replace("\xa0", " ")
+        
+        # Extraer solo el número flotante (ej. "675.00 CUP" -> 675.00)
+        match_rate = re.search(r"([\d\.]+)", rate_text)
+        rate_val = float(match_rate.group(1)) if match_rate else None
+
+        # 3. Extraer la variación (ej. "+2.98" o "-0.6"), si existe
+        change_span = value_cell.find("span", class_=re.compile(r"text-xs"))
+        change_val = change_span.get_text(strip=True) if change_span else "0.00"
+
+        tasas[currency] = {
+            "tasa_cup": rate_val,
+            "variacion": change_val,
+            "texto_raw": rate_text
+        }
+
+    return tasas
+
+@app.get("/scrape-tasas")
+def get_tasas(
+    url: str = Query(
+        default="https://eltoque.com",
+        description="URL de El Toque a consultar"
+    )
+):
+    try:
+        # Realizamos la petición HTTP
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Error al intentar obtener la página: {str(e)}"
+        )
+
+    # Parseamos el HTML obtenido
+    data = parse_tasas_html(response.text)
+
+    if not data:
+        raise HTTPException(
+            status_code=404, 
+            detail="No se encontraron datos de tasas en la URL proporcionada."
+        )
+
     return {
-        "message": "Servidor activo",
-        "endpoints": {
-            "rates": "/api/v1/rates",
-            "refresh": "/api/v1/rates/refresh",
-        },
+        "status": "success",
+        "url": url,
+        "tasas": data
     }
 
 
-@app.get("/api/v1/rates")
-def get_rates():
-    return latest_rates
-
-
-@app.post("/api/v1/rates/refresh")
-async def refresh():
-    await fetch_rates()
-
-    return {
-        "message": "Actualizado",
-        "data": latest_rates,
-    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

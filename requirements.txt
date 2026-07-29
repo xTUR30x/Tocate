@@ -1,6 +1,4 @@
 fastapi
 uvicorn
+requests
 beautifulsoup4
-playwright
-apscheduler
-lxml
