@@ -1,104 +1,110 @@
-import re
-from typing import Dict, Any
-from fastapi import FastAPI, HTTPException, Query
-import requests
+from typing import Optional
 from bs4 import BeautifulSoup
+import httpx, re
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, Field
 
 app = FastAPI(
-    title="API Scraper de Tasas de Cambio - El Toque",
-    description="Endpoint para obtener las tasas del informal en Cuba usando BeautifulSoup4."
+    title="Rates API",
+    version="1.0.0",
+    description="Servicio para extraer tasas informales de cambio desde Telegram",
 )
 
-headers = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+
+class RateResponse(BaseModel):
+    status: str = Field(
+        default="success",
+        description="Estado del resultado de la solicitud",
     )
-}
-
-def parse_tasas_html(html_content: str) -> Dict[str, Any]:
-    """
-    Parsea el contenido HTML con BeautifulSoup para extraer la moneda, 
-    su valor en CUP y la variación si existe.
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
-    tasas = {}
-
-    # Buscamos todas las filas <tr> de la tabla
-    rows = soup.find_all("tr")
-
-    for row in rows:
-        # 1. Extraer la moneda/moneda objetivo (ej. "1 USD", "1 EUR", "1 MLC", etc.)
-        currency_cell = row.find("span", id=re.compile(r"^cell-title-v2-"))
-        if not currency_cell:
-            continue
-        
-        currency_raw = currency_cell.get_text(strip=True)
-        # Limpiamos espacios no divisibles (&nbsp;) y extraemos el código (ej. USD)
-        currency = currency_raw.replace("\xa0", " ").strip()
-
-        # 2. Extraer el valor en CUP y posible variación
-        value_cell = row.find("td", class_=re.compile(r"pl-3"))
-        if not value_cell:
-            continue
-
-        # El valor principal está en el span con 'font-extrabold text-lg'
-        rate_span = value_cell.find("span", class_=re.compile(r"font-extrabold"))
-        if not rate_span:
-            continue
-
-        rate_text = rate_span.get_text(strip=True).replace("\xa0", " ")
-        
-        # Extraer solo el número flotante (ej. "675.00 CUP" -> 675.00)
-        match_rate = re.search(r"([\d\.]+)", rate_text)
-        rate_val = float(match_rate.group(1)) if match_rate else None
-
-        # 3. Extraer la variación (ej. "+2.98" o "-0.6"), si existe
-        change_span = value_cell.find("span", class_=re.compile(r"text-xs"))
-        change_val = change_span.get_text(strip=True) if change_span else "0.00"
-
-        tasas[currency] = {
-            "tasa_cup": rate_val,
-            "variacion": change_val,
-            "texto_raw": rate_text
-        }
-
-    return tasas
-
-@app.get("/scrape-tasas")
-def get_tasas(
-    url: str = Query(
-        default="https://eltoque.com",
-        description="URL de El Toque a consultar"
+    usd: Optional[float] = Field(
+        default=None, description="Tasa del Dólar estadounidense (USD)"
     )
-):
-    try:
-        # Realizamos la petición HTTP
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Error al intentar obtener la página: {str(e)}"
+    eur: Optional[float] = Field(
+        default=None, description="Tasa del Euro (EUR)"
+    )
+    published_at: Optional[str] = Field(
+        default=None,
+        description="Fecha y hora ISO 8601 de publicación del mensaje",
+    )
+
+
+def fetch_latest_rates_from_telegram(
+    channel_username: str = "eltoquecom",
+) -> RateResponse:
+    url = f"https://t.me/s/{channel_username}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-
-    # Parseamos el HTML obtenido
-    data = parse_tasas_html(response.text)
-
-    if not data:
-        raise HTTPException(
-            status_code=404, 
-            detail="No se encontraron datos de tasas en la URL proporcionada."
-        )
-
-    return {
-        "status": "success",
-        "url": url,
-        "tasas": data
     }
 
+    try:
+        response = httpx.get(url, headers=headers, timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPError as err:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Error al conectar con la vista web de Telegram: {str(err)}",
+        )
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    soup = BeautifulSoup(response.text, "html.parser")
+    messages = soup.find_all("div", class_="tgme_widget_message")
+
+    if not messages:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se encontraron mensajes en el canal especificado.",
+        )
+
+    # Recorremos los mensajes desde el más reciente hacia atrás
+    for msg in reversed(messages):
+        text_node = msg.find("div", class_="tgme_widget_message_text")
+        if not text_node:
+            continue
+
+        raw_text = text_node.get_text(separator="\n").strip()
+
+        # Regex para capturar importes numéricos tras las siglas USD/EUR
+        usd_match = re.search(
+            r"(?:USD|Dólar|Dolar)\s*[:=-]?\s*(\d+(?:\.\d+)?)",
+            raw_text,
+            re.IGNORECASE,
+        )
+        eur_match = re.search(
+            r"(?:EUR|Euro)\s*[:=-]?\s*(\d+(?:\.\d+)?)",
+            raw_text,
+            re.IGNORECASE,
+        )
+
+        if usd_match or eur_match:
+            time_node = msg.find("time", class_="time")
+            published_at = time_node.get("datetime") if time_node else None
+
+            return RateResponse(
+                status="success",
+                usd=float(usd_match.group(1)) if usd_match else None,
+                eur=float(eur_match.group(1)) if eur_match else None,
+                published_at=published_at,
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="No se encontró ningún mensaje reciente que contenga tasas de cambio.",
+    )
+
+
+@app.get(
+    "/api/v1/rates",
+    response_model=RateResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Obtener las últimas tasas de cambio",
+)
+async def get_rates():
+    """Busca en el canal de Telegram el último mensaje publicado con los valores
+
+    del USD y EUR, extrayendo los datos numéricos y la fecha/hora de
+    publicación.
+    """
+    return fetch_latest_rates_from_telegram(channel_username="eltoquecom")
