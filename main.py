@@ -12,10 +12,6 @@ app = FastAPI(
 
 
 class RateResponse(BaseModel):
-    status: str = Field(
-        default="success",
-        description="Estado del resultado de la solicitud",
-    )
     usd: Optional[float] = Field(
         default=None, description="Tasa del Dólar estadounidense (USD)"
     )
@@ -25,6 +21,10 @@ class RateResponse(BaseModel):
     published_at: Optional[str] = Field(
         default=None,
         description="Fecha y hora ISO 8601 de publicación del mensaje",
+    )
+    status: str = Field(
+        default="success",
+        description="Estado del resultado de la solicitud",
     )
 
 
