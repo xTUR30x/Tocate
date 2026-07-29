@@ -83,10 +83,10 @@ def fetch_latest_rates_from_telegram(
             published_at = time_node.get("datetime") if time_node else None
 
             return RateResponse(
-                status="success",
                 usd=float(usd_match.group(1)) if usd_match else None,
                 eur=float(eur_match.group(1)) if eur_match else None,
                 published_at=published_at,
+                status="success",
             )
 
     raise HTTPException(
