@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 beautifulsoup4
+playwright
 apscheduler
-curl_cffi
-python-dotenv
+lxml
