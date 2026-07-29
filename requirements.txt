@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-httpx
 beautifulsoup4
 apscheduler
+curl_cffi
+python-dotenv
